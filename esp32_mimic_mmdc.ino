@@ -1,134 +1,176 @@
 /*
  * mmdc emulator
- * this program emulates a medallion mmdc by continually requesting water depth via rs485
- * 
+ * Emulates a Medallion MMDC by polling for water depth via RS485.
+ *
+ * Toggle bit detection:
+ *   Response byte [10] is a toggle bit that the gateway flips on every
+ *   reply. We track it across consecutive responses to detect whether
+ *   the gateway is sending fresh NMEA2k data or holding the last known
+ *   good value (stale). When the toggle stops flipping the gateway has
+ *   stopped responding entirely. When it keeps flipping but depth is
+ *   unchanged for several seconds the gateway is in "stale hold" mode —
+ *   which should cause the real MMDC display to blink the last value.
  */
-
 
 #include <HardwareSerial.h>
 #include <math.h>
 
-// RS485 serial and control pin definitions
-#define RS485_RX_PIN 16   // Adjust as needed
-#define RS485_TX_PIN 17   // Adjust as needed
-#define RS485_DE_RE_PIN 21 // Adjust as needed (DE+RE tied together)
+// RS485 pins
+#define RS485_RX_PIN    16
+#define RS485_TX_PIN    17
+#define RS485_DE_RE_PIN 21
 
-// Depth request and response parameters
-const uint8_t DEPTH_REQUEST[] = {0x04, 0x09, 0x11, 0xE2};  // MMDC request
-//const uint8_t DEPTH_REQUEST[] = {0x04, 0x09, 0x8B, 0x68};  // MMDC request
-const size_t DEPTH_REQUEST_LEN = sizeof(DEPTH_REQUEST);
-const size_t DEPTH_RESPONSE_LEN = 13;
-const uint32_t BAUDRATE = 76800;
-const unsigned long REQUEST_INTERVAL_MS = 1000;
+const uint8_t  DEPTH_REQUEST[]    = {0x04, 0x09, 0x11, 0xE2};
+const size_t   DEPTH_REQUEST_LEN  = sizeof(DEPTH_REQUEST);
+const size_t   DEPTH_RESPONSE_LEN = 13;
+const uint32_t BAUDRATE           = 76800;
+
+// How long with no toggle change before we declare the gateway silent
+#define TOGGLE_STALE_MS   3000
+// How long with same depth + live toggle before we declare depth stale
+#define DEPTH_STALE_MS    6000
 
 HardwareSerial RS485Serial(2);
 
-void enableTransmit() {
-  digitalWrite(RS485_DE_RE_PIN, HIGH);
-}
+// ── Toggle tracking ───────────────────────────────────────────────────────────
+static uint8_t  lastToggle       = 0xFF;   // 0xFF = never seen
+static uint32_t lastToggleFlipMs = 0;
+static bool     toggleFlipping   = false;
 
-void enableReceive() {
-  digitalWrite(RS485_DE_RE_PIN, LOW);
-}
+// ── Depth tracking ────────────────────────────────────────────────────────────
+static float    lastDepthFt      = -1.0f;
+static uint32_t lastDepthChangeMs= 0;
+static bool     depthStaleHold   = false;  // toggle alive but depth unchanged
 
-// Calculate 8-bit two's complement checksum
+// ── Stats ─────────────────────────────────────────────────────────────────────
+static uint32_t responseCount    = 0;
+static uint32_t timeoutCount     = 0;
+static uint32_t checksumFail     = 0;
+
 uint8_t calculate_checksum(const uint8_t *data, uint8_t len) {
   uint8_t total = 0;
-  for (uint8_t i = 0; i < len; i++) {
-    total = (total + data[i]) & 0xFF;
-  }
+  for (uint8_t i = 0; i < len; i++) total = (total + data[i]) & 0xFF;
   return ((~total + 1) & 0xFF);
 }
 
 bool verifyChecksum(const uint8_t *response, size_t len) {
-  if (len < 2) return false; // need at least 2 bytes to check
-  uint8_t calculated = calculate_checksum(response, len - 1);
-  uint8_t received = response[len - 1];
-  return calculated == received;
+  if (len < 2) return false;
+  return calculate_checksum(response, len - 1) == response[len - 1];
 }
 
-// Extracts depth value from response (bytes 5=low [4], 6=high [5], in tenths of a foot)
-float extractDepthFeet(const uint8_t* response) {
-  uint16_t depth_encoded = ((uint16_t)response[5] << 8) | response[4];
-  return depth_encoded / 10.0f;
+float extractDepthFeet(const uint8_t *response) {
+  uint16_t encoded = ((uint16_t)response[5] << 8) | response[4];
+  return encoded / 10.0f;
 }
 
 void setup() {
   pinMode(RS485_DE_RE_PIN, OUTPUT);
-  enableReceive();
+  digitalWrite(RS485_DE_RE_PIN, LOW);
 
   Serial.begin(115200);
   RS485Serial.begin(BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
-  Serial.println("ESP32 RS485 Depth Requester started.");
-  Serial.println("emulating rs485 water depth requests");
+  Serial.println("\n=== MMDC Emulator ===");
+  Serial.println("Polling for depth. Monitoring toggle bit for stale-data detection.");
+  Serial.println("Toggle byte = response[10]");
+  Serial.println();
 }
 
 void loop() {
-  // Send depth request
-  
-  enableTransmit();
-  Serial.print("Sending water depth request (");
-  Serial.print(DEPTH_REQUEST_LEN);
-  Serial.print(" bytes): ");
+  uint32_t now = millis();
 
-  // Output each byte in hex format for debugging
-  for (int i = 0; i < DEPTH_REQUEST_LEN; i++) {
-    Serial.print("0x");
-    if (DEPTH_REQUEST[i] < 0x10) Serial.print("0"); // Add leading zero for single digits
-    Serial.print(DEPTH_REQUEST[i], HEX);
-    if (i < DEPTH_REQUEST_LEN - 1) Serial.print(" ");
-  }
-  Serial.println();
-  
-
-  delayMicroseconds(200); // Allow line to settle
+  // ── Send request ───────────────────────────────────────────────────────────
+  digitalWrite(RS485_DE_RE_PIN, HIGH);
+  delayMicroseconds(200);
   RS485Serial.write(DEPTH_REQUEST, DEPTH_REQUEST_LEN);
   RS485Serial.flush();
-  delayMicroseconds(500); // Wait for transmission to complete
-  
-  enableReceive();
+  delayMicroseconds(500);
+  digitalWrite(RS485_DE_RE_PIN, LOW);
 
-  // Try to read the response
-  uint8_t response[DEPTH_RESPONSE_LEN];
-  size_t bytesRead = 0;
-  unsigned long startTime = millis();
-  while (bytesRead < DEPTH_RESPONSE_LEN && (millis() - startTime) < 500) { // 500ms timeout
-    if (RS485Serial.available()) {
-      response[bytesRead++] = RS485Serial.read();
-    }
+  // ── Read response ──────────────────────────────────────────────────────────
+  uint8_t  response[DEPTH_RESPONSE_LEN];
+  size_t   bytesRead = 0;
+  uint32_t startTime = millis();
+
+  while (bytesRead < DEPTH_RESPONSE_LEN && (millis() - startTime) < 500) {
+    if (RS485Serial.available()) response[bytesRead++] = RS485Serial.read();
   }
 
+  // ── Process ────────────────────────────────────────────────────────────────
   if (bytesRead == DEPTH_RESPONSE_LEN) {
+
     if (!verifyChecksum(response, DEPTH_RESPONSE_LEN)) {
-      Serial.println("Checksum failed, ignoring response.");
-      delay(REQUEST_INTERVAL_MS);
+      checksumFail++;
+      Serial.printf("[%lus] Checksum FAIL (total fails: %lu)\n",
+                    now / 1000, checksumFail);
+      delay(1000);
       return;
     }
 
-    Serial.print("Received response: ");
-    for (size_t i = 0; i < DEPTH_RESPONSE_LEN; i++) {
-      if (response[i] < 0x10) Serial.print("0");
-      Serial.print(response[i], HEX);
-      Serial.print(" ");
-    }
-    Serial.println();
+    responseCount++;
+    uint8_t toggle   = response[10];
+    float   depthFt  = extractDepthFeet(response);
 
-    // Extract and display depth value in feet (from bytes 5 and 6, low/high)
-    float depth_feet = extractDepthFeet(response);
-    Serial.print("Extracted Depth: ");
-    if (depth_feet < 100.0) {
-      Serial.print(depth_feet, 1); // one decimal place
+    // ── Toggle analysis ─────────────────────────────────────────────────────
+    bool toggleChanged = (lastToggle == 0xFF) || (toggle != lastToggle);
+    if (toggleChanged) {
+      lastToggle       = toggle;
+      lastToggleFlipMs = now;
+      toggleFlipping   = true;
     } else {
-      Serial.print((int)round(depth_feet)); // whole number, rounded
+      // Toggle did not change this response
+      if ((now - lastToggleFlipMs) > TOGGLE_STALE_MS) {
+        toggleFlipping = false;
+      }
     }
-    Serial.println(" ft");
+
+    // ── Depth change tracking ────────────────────────────────────────────────
+    if (depthFt != lastDepthFt) {
+      lastDepthFt       = depthFt;
+      lastDepthChangeMs = now;
+      depthStaleHold    = false;
+    } else {
+      // Depth unchanged — stale hold if toggle still flipping but depth frozen
+      if (toggleFlipping && (now - lastDepthChangeMs) > DEPTH_STALE_MS) {
+        depthStaleHold = true;
+      }
+    }
+
+    // ── Determine display state ──────────────────────────────────────────────
+    const char *state;
+    if (!toggleFlipping) {
+      state = "GATEWAY SILENT (toggle frozen - no RS485 responses)";
+    } else if (depthStaleHold) {
+      state = "STALE HOLD (toggle live, depth frozen - NMEA2k lost, display should BLINK)";
+    } else {
+      state = "OK";
+    }
+
+    // ── Print ────────────────────────────────────────────────────────────────
+    Serial.printf("[%lus] depth=%.1f ft  toggle=0x%02X(%s)  state=%s\n",
+                  now / 1000,
+                  depthFt,
+                  toggle,
+                  toggleChanged ? "FLIPPED" : "same",
+                  state);
+
+    // Raw hex on first response and whenever state changes
+    static const char *lastState = nullptr;
+    if (lastState != state) {
+      Serial.print("       raw: ");
+      for (size_t i = 0; i < DEPTH_RESPONSE_LEN; i++) {
+        Serial.printf("%02X ", response[i]);
+      }
+      Serial.println();
+      lastState = state;
+    }
 
   } else {
-    Serial.print("No response received (timeout), got ");
-    Serial.print(bytesRead);
-    Serial.println(" bytes.");
+    timeoutCount++;
+    toggleFlipping = false;
+    Serial.printf("[%lus] TIMEOUT - got %u/%u bytes (timeouts: %lu)\n",
+                  now / 1000, bytesRead, DEPTH_RESPONSE_LEN, timeoutCount);
   }
 
-  delay(REQUEST_INTERVAL_MS);
+  delay(1000);
 }
