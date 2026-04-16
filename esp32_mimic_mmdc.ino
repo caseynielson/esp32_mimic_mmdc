@@ -80,6 +80,10 @@ void loop() {
   uint32_t now = millis();
 
   // ── Send request ───────────────────────────────────────────────────────────
+  Serial.printf("[%lus] TX: ", now / 1000);
+  for (size_t i = 0; i < DEPTH_REQUEST_LEN; i++) Serial.printf("%02X ", DEPTH_REQUEST[i]);
+  Serial.println();
+
   digitalWrite(RS485_DE_RE_PIN, HIGH);
   delayMicroseconds(200);
   RS485Serial.write(DEPTH_REQUEST, DEPTH_REQUEST_LEN);
@@ -108,6 +112,10 @@ void loop() {
     }
 
     responseCount++;
+    Serial.printf("[%lus] RX: ", now / 1000);
+    for (size_t i = 0; i < DEPTH_RESPONSE_LEN; i++) Serial.printf("%02X ", response[i]);
+    Serial.println();
+
     uint8_t toggle   = response[10];
     float   depthFt  = extractDepthFeet(response);
 
@@ -154,16 +162,7 @@ void loop() {
                   toggleChanged ? "FLIPPED" : "same",
                   state);
 
-    // Raw hex on first response and whenever state changes
-    static const char *lastState = nullptr;
-    if (lastState != state) {
-      Serial.print("       raw: ");
-      for (size_t i = 0; i < DEPTH_RESPONSE_LEN; i++) {
-        Serial.printf("%02X ", response[i]);
-      }
-      Serial.println();
-      lastState = state;
-    }
+
 
   } else {
     timeoutCount++;
