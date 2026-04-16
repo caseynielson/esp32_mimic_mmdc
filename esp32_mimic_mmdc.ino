@@ -99,12 +99,12 @@ void loop() {
     }
   }
 
-  //if (bytesRead == DEPTH_RESPONSE_LEN) {
-  //  if (!verifyChecksum(response, DEPTH_RESPONSE_LEN)) {
-  //    Serial.println("Checksum failed, ignoring response.");
-  //    delay(REQUEST_INTERVAL_MS);
-  //    return;
-  //  }
+  if (bytesRead == DEPTH_RESPONSE_LEN) {
+    if (!verifyChecksum(response, DEPTH_RESPONSE_LEN)) {
+      Serial.println("Checksum failed, ignoring response.");
+      delay(REQUEST_INTERVAL_MS);
+      return;
+    }
 
     Serial.print("Received response: ");
     for (size_t i = 0; i < DEPTH_RESPONSE_LEN; i++) {
@@ -124,10 +124,11 @@ void loop() {
     }
     Serial.println(" ft");
 
-
-  //} else {
-  //  Serial.println("No response received (timeout).");
-  //}
+  } else {
+    Serial.print("No response received (timeout), got ");
+    Serial.print(bytesRead);
+    Serial.println(" bytes.");
+  }
 
   delay(REQUEST_INTERVAL_MS);
 }
